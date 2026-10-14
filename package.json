@@ -1,0 +1,14 @@
+{
+  "name": "stopspotter-title-tiles",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "scripts": {
+    "test": "node scripts/lib/bngToWgs84.test.mjs && node scripts/lib/titleTiles.test.mjs"
+  },
+  "dependencies": {
+    "fast-xml-parser": "^5.11.2",
+    "fflate": "^0.8.3",
+    "shapefile": "^0.6.6"
+  }
+}

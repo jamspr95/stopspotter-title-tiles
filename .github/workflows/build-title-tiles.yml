@@ -1,0 +1,144 @@
+name: Build title boundary tiles
+
+# Builds the on-demand title-lookup tile set (see
+# docs/TITLE_BOUNDARY_API_PLAN.md) and publishes it as GitHub Release
+# assets. Replaces the old sync-title-boundaries-{ew,scotland}.yml design,
+# which upserted the whole national dataset into Postgres — this workflow
+# never touches Postgres and needs no Supabase secret at all.
+#
+# Both build scripts write into one shared directory as
+# <nation>/<shardId>.json.gz (scripts/lib/titleTiles.mjs's
+# appendParcelsToTiles layout — each gzipped shard covers a 5x5 block of
+# the fine 0.1-degree lookup cells, keyed internally by fine cell id, so a
+# full-Great-Britain build produces roughly 128 shard files rather than
+# the ~3,000 individual fine-cell files an earlier version of this
+# pipeline would have — comfortably under GitHub Releases' 1,000-asset
+# cap, with real headroom). Release assets can't hold subdirectories and
+# must be named exactly <nation>_<shardId>.json.gz — the exact filename
+# supabase/functions/lookup-title-boundary/index.ts requests — so the
+# "flatten" step below copies each file into a single directory with that
+# prefix before upload, rather than uploading the raw tree directly.
+# (Uploading the tree as-is would hand `gh` bare `<shardId>.json.gz`
+# basenames with no nation prefix, which would both collide between the
+# two nations' same shard id and not match what the edge function fetches.)
+on:
+  schedule:
+    # Both source registries publish at most quarterly (HMLR ~monthly,
+    # RoS quarterly) — run on the 8th of Jan/Apr/Jul/Oct (04:00 UTC), a day
+    # after both sync workflows' own publish-buffer days, so a from-scratch
+    # tile rebuild always starts from each source's latest data.
+    - cron: '0 4 8 1,4,7,10 *'
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Dry run (parse and log, write/publish nothing)'
+        type: boolean
+        default: false
+      council:
+        description: 'England & Wales: only this council (substring match); leave blank for --all'
+        type: string
+        default: ''
+      county:
+        description: 'Scotland: only this Registration County (substring match); leave blank for --all'
+        type: string
+        default: ''
+
+permissions:
+  contents: write # to create/replace the title-tiles-latest release and its assets
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350 # ~380 councils + 33 counties, one fetch + parse each — same budget as the two sync workflows combined
+    env:
+      OUT_DIR: ./title-tiles-build
+      ASSETS_DIR: ./title-tiles-assets
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+
+      - name: Build England & Wales tiles
+        run: |
+          ARGS="--all"
+          if [ -n "${{ inputs.council }}" ]; then
+            ARGS="--council=${{ inputs.council }}"
+          fi
+          if [ "${{ inputs.dry_run }}" = "true" ]; then
+            ARGS="$ARGS --dry-run"
+          fi
+          node scripts/build-title-tiles-ew.mjs $ARGS --out="$OUT_DIR"
+
+      - name: Build Scotland tiles
+        run: |
+          ARGS="--all"
+          if [ -n "${{ inputs.county }}" ]; then
+            ARGS="--county=${{ inputs.county }}"
+          fi
+          if [ "${{ inputs.dry_run }}" = "true" ]; then
+            ARGS="$ARGS --dry-run"
+          fi
+          node scripts/build-title-tiles-scotland.mjs $ARGS --out="$OUT_DIR"
+
+      - name: Flatten shards into <nation>_<shardId>.json.gz release assets
+        if: inputs.dry_run != 'true'
+        run: |
+          set -euo pipefail
+          mkdir -p "$ASSETS_DIR"
+          shopt -s nullglob
+          for nation_dir in "$OUT_DIR"/*/; do
+            nation="$(basename "$nation_dir")"
+            for f in "$nation_dir"*.json.gz; do
+              cp "$f" "$ASSETS_DIR/${nation}_$(basename "$f")"
+            done
+          done
+          count=$(find "$ASSETS_DIR" -name '*.json.gz' | wc -l)
+          echo "Flattened $count shard asset(s) into $ASSETS_DIR."
+          if [ "$count" -eq 0 ]; then
+            echo "No shard files were produced by either build script — refusing to publish an empty release." >&2
+            exit 1
+          fi
+
+      # GitHub Releases cap out at 1000 assets per release (confirmed against
+      # GitHub's own docs, Oct 2026). A full Great-Britain build is expected
+      # to land around 128 shard files (see scripts/lib/titleTiles.mjs's
+      # 5x5-fine-cells-per-shard grouping) — comfortably under the cap, with
+      # real headroom — but this is still an ESTIMATE, not something provable
+      # from this sandbox (a real --all run needs the live HMLR/RoS sources,
+      # which this environment can't reach). Kept as a loud failure rather
+      # than a silent truncated publish if that estimate ever turns out
+      # wrong; if it fires, the fix is a larger FINE_CELLS_PER_SHARD, not a
+      # workaround here.
+      - name: Check asset count against GitHub's per-release limit
+        if: inputs.dry_run != 'true'
+        run: |
+          count=$(find "$ASSETS_DIR" -name '*.json.gz' | wc -l)
+          echo "$count shard asset(s) to publish."
+          if [ "$count" -gt 950 ]; then
+            echo "$count assets would exceed (or come dangerously close to) GitHub's documented 1000-asset-per-release limit." >&2
+            echo "Expected roughly 128 for a full Great-Britain build — see scripts/lib/titleTiles.mjs's FINE_CELLS_PER_SHARD. Increase that constant (in both this repo's copy and supabase/functions/lookup-title-boundary/index.ts's duplicate) rather than publishing a truncated set." >&2
+            exit 1
+          fi
+
+      # gh release create takes a list of asset files/patterns and relies on
+      # the CALLING SHELL to expand any glob in them (confirmed against the
+      # installed gh CLI's own --help: "USAGE gh release create [<tag>]
+      # [<filename>... | <pattern>...]", with its own example
+      # `gh release create v1.2.3 ./dist/*.tgz` left unquoted) — it does not
+      # itself walk directories or expand `**`. $ASSETS_DIR/*.json.gz is a
+      # flat, single-level glob (no subdirectories by this point, see the
+      # flatten step above), so plain bash globbing is enough; no globstar
+      # needed.
+      - name: Publish release (replaces title-tiles-latest entirely)
+        if: inputs.dry_run != 'true'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          gh release delete title-tiles-latest --yes || true
+          gh release create title-tiles-latest "$ASSETS_DIR"/*.json.gz \
+            --title "Title boundary tiles" \
+            --notes "Built $(date -u +%Y-%m-%d)"
