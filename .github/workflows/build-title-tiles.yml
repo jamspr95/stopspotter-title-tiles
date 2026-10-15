@@ -61,7 +61,17 @@ jobs:
           cache: npm
       - run: npm ci
 
+      # continue-on-error: a handful of per-council failures (a transient
+      # fetch blip, one outlier council too large to parse — see below)
+      # are close to GUARANTEED on every real --all run against 318
+      # councils, and treating any of them as fatal to the whole job
+      # means the pipeline can never publish anything, ever, defeating
+      # the point. The trailing "Fail the job" step below still turns
+      # the job red when this happens, so it stays visible — it just no
+      # longer blocks the 97%+ of real data that DID parse from shipping.
       - name: Build England & Wales tiles
+        id: build_ew
+        continue-on-error: true
         run: |
           ARGS="--all"
           if [ -n "${{ inputs.council }}" ]; then
@@ -73,6 +83,8 @@ jobs:
           node scripts/build-title-tiles-ew.mjs $ARGS --out="$OUT_DIR"
 
       - name: Build Scotland tiles
+        id: build_scotland
+        continue-on-error: true
         run: |
           ARGS="--all"
           if [ -n "${{ inputs.county }}" ]; then
@@ -142,3 +154,13 @@ jobs:
           gh release create title-tiles-latest "$ASSETS_DIR"/*.json.gz \
             --title "Title boundary tiles" \
             --notes "Built $(date -u +%Y-%m-%d)"
+
+      # Surfaces a per-council failure as a red job (so it's never
+      # silently missed) without having blocked the publish step above
+      # from shipping whatever DID parse correctly. Deliberately runs
+      # last — after Publish, not instead of it.
+      - name: Fail the job if either nation had per-council build errors
+        if: steps.build_ew.outcome == 'failure' || steps.build_scotland.outcome == 'failure'
+        run: |
+          echo "One or both build steps above failed to parse some councils/counties — see their own logs for which ones and why. The release was still published with everything that DID parse correctly; this failure is just to make sure the gap doesn't go unnoticed." >&2
+          exit 1

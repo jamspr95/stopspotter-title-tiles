@@ -32,6 +32,7 @@ import { readdir, readFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { fetchWithCookieJar } from './lib/httpWithCookies.mjs'
 import { describeGmlStructure, extractGmlTexts, extractParcels } from './lib/inspireGml.mjs'
+import { withRetries } from './lib/retry.mjs'
 import { finalizeShards, writeParcelsToShardParts } from './lib/titleTiles.mjs'
 
 const LOCAL_FILE_EXTENSIONS = ['.gml', '.gml.gz', '.zip', '.xml']
@@ -94,7 +95,14 @@ async function findCouncilLinks() {
 
 async function buildOneCouncil(outDir, name, getBytes, dryRun) {
   console.log(`Reading ${name}...`)
-  const buffer = await getBytes()
+  // Retries only the download — confirmed from a real run (Oct 2026)
+  // that several councils failed with a bare "fetch failed" and
+  // nothing else, the signature of a one-off network blip, not a
+  // parsing bug. Parsing failures below are never retried: those are
+  // reproducible (a schema assumption that's wrong for this file, or a
+  // file too large for one JS string), and retrying would just waste
+  // time repeating the same failure.
+  const buffer = await withRetries(getBytes)
   const gmlTexts = extractGmlTexts(buffer)
 
   const parcels = gmlTexts.flatMap(extractParcels)

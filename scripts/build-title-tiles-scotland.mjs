@@ -31,6 +31,7 @@ import { readdir, readFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { fetchWithCookieJar } from './lib/httpWithCookies.mjs'
 import { extractParcelsFromBytes } from './lib/parcelExtraction.mjs'
+import { withRetries } from './lib/retry.mjs'
 import { finalizeShards, writeParcelsToShardParts } from './lib/titleTiles.mjs'
 
 const DOWNLOAD_PAGE = 'https://ros-inspire.themapcloud.com/'
@@ -103,7 +104,9 @@ async function fetchBytes(name, href) {
 
 async function buildOneCounty(outDir, name, getBytes, dryRun) {
   console.log(`Reading ${name}...`)
-  const buffer = await getBytes()
+  // See build-title-tiles-ew.mjs's buildOneCouncil for why only the
+  // download gets retried, not the parse.
+  const buffer = await withRetries(getBytes)
   const parcels = await extractParcelsFromBytes(buffer)
 
   console.log(`  parsed ${parcels.length} parcels`)
