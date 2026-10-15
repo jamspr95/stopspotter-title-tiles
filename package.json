@@ -4,7 +4,7 @@
   "version": "0.0.0",
   "type": "module",
   "scripts": {
-    "test": "node scripts/lib/bngToWgs84.test.mjs && node scripts/lib/titleTiles.test.mjs"
+    "test": "node scripts/lib/bngToWgs84.test.mjs && node scripts/lib/titleTiles.test.mjs && node scripts/lib/inspireGml.test.mjs"
   },
   "dependencies": {
     "fast-xml-parser": "^5.11.2",

@@ -31,9 +31,36 @@
 import { readdir, readFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { fetchWithCookieJar } from './lib/httpWithCookies.mjs'
-import { describeGmlStructure, extractGmlTexts, extractParcels } from './lib/inspireGml.mjs'
+import {
+  describeGmlStructure,
+  extractGmlBuffers,
+  extractGmlTexts,
+  extractParcels,
+  extractParcelsFromLargeBuffer,
+  isStringTooLongError,
+} from './lib/inspireGml.mjs'
 import { withRetries } from './lib/retry.mjs'
 import { finalizeShards, writeParcelsToShardParts } from './lib/titleTiles.mjs'
+
+/**
+ * Parses one council's raw download into parcels, trying the normal
+ * (fast, proven) whole-string path first and falling back to the
+ * streaming parser ONLY on the specific oversized-file failure it exists
+ * to fix — every other error (a real schema mismatch, a corrupt
+ * download) still surfaces exactly as before, unchanged.
+ */
+function parseGmlBuffer(name, buffer) {
+  try {
+    const gmlTexts = extractGmlTexts(buffer)
+    return { parcels: gmlTexts.flatMap(extractParcels), fileCount: gmlTexts.length, streamed: false, sampleText: gmlTexts[0] }
+  } catch (err) {
+    if (!isStringTooLongError(err)) throw err
+    console.log(`  ${name}'s GML is too large for one JS string — falling back to the streaming parser`)
+    const gmlBuffers = extractGmlBuffers(buffer)
+    const parcels = gmlBuffers.flatMap((buf) => extractParcelsFromLargeBuffer(buf))
+    return { parcels, fileCount: gmlBuffers.length, streamed: true, sampleText: null }
+  }
+}
 
 const LOCAL_FILE_EXTENSIONS = ['.gml', '.gml.gz', '.zip', '.xml']
 const DEFAULT_OUT_DIR = './title-tiles-build'
@@ -103,15 +130,13 @@ async function buildOneCouncil(outDir, name, getBytes, dryRun) {
   // file too large for one JS string), and retrying would just waste
   // time repeating the same failure.
   const buffer = await withRetries(getBytes)
-  const gmlTexts = extractGmlTexts(buffer)
-
-  const parcels = gmlTexts.flatMap(extractParcels)
-  console.log(`  parsed ${parcels.length} parcels (from ${gmlTexts.length} GML file${gmlTexts.length === 1 ? '' : 's'})`)
+  const { parcels, fileCount, streamed, sampleText } = parseGmlBuffer(name, buffer)
+  console.log(`  parsed ${parcels.length} parcels (from ${fileCount} GML file${fileCount === 1 ? '' : 's'}${streamed ? ', streamed' : ''})`)
   if (parcels.length === 0) {
     throw new Error(
       [
         `${name}: parsed zero parcels from a non-empty download — the parser's assumptions about HMLR's schema are likely wrong for this file. Stopping rather than silently writing nothing into the tiles. See scripts/sync-title-boundaries-ew.mjs's header comment.`,
-        gmlTexts[0] ? describeGmlStructure(gmlTexts[0]) : '(no GML text extracted)',
+        sampleText ? describeGmlStructure(sampleText) : '(streamed parse — no single sample text available; re-run without triggering the streaming fallback to get a describeGmlStructure preview, e.g. against a --dir copy if the file is small enough once decompressed)',
       ].join('\n'),
     )
   }

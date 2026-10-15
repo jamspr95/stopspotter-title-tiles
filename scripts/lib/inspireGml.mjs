@@ -9,6 +9,18 @@ import { XMLParser } from 'fast-xml-parser'
 import { unzipSync } from 'fflate'
 import { bngToWgs84 } from './bngToWgs84.mjs'
 
+/**
+ * True for the specific V8 "string too long" failure a whole-document
+ * `.toString('utf8')` call hits on an outlier-sized GML file — see
+ * extractParcelsFromLargeBuffer's header comment below for the real
+ * incident and the fix. Shared by both build-title-tiles-{ew,scotland}.mjs
+ * so each can fall back to the streaming parser on exactly this failure
+ * and no other.
+ */
+export function isStringTooLongError(err) {
+  return err instanceof RangeError && /string length|longer than/i.test(err.message)
+}
+
 /** A manually-downloaded file might be gzipped (common for INSPIRE Atom links) or plain — detect by magic bytes, not the file extension, and decompress either way. */
 export function decompressIfGzip(buffer) {
   if (buffer.length >= 2 && buffer[0] === 0x1f && buffer[1] === 0x8b) {
@@ -45,6 +57,33 @@ export function extractGmlTexts(buffer) {
     return gmlEntries.map(([, data]) => Buffer.from(data).toString('utf8'))
   }
   return [decompressIfGzip(buffer)]
+}
+
+/**
+ * Byte-level twin of extractGmlTexts/decompressIfGzip: returns each GML
+ * entry as a Buffer, WITHOUT ever calling .toString('utf8') on it. Exists
+ * only for extractParcelsFromLargeBuffer below — a Buffer's length limit
+ * (~2GB on 64-bit Node) is far past a JS string's (~536M UTF-16 code
+ * units), so this is the only way to hold an oversized GML file's bytes
+ * at all before streaming-parsing it in bounded windows.
+ */
+export function extractGmlBuffers(buffer) {
+  if (isZip(buffer)) {
+    const entries = unzipSync(buffer)
+    const gmlEntries = Object.entries(entries).filter(([name]) =>
+      GML_ENTRY_EXTENSIONS.some((ext) => name.toLowerCase().endsWith(ext)),
+    )
+    if (gmlEntries.length === 0) {
+      throw new Error(
+        `Zip archive had no .gml/.xml entry — found: ${Object.keys(entries).join(', ') || '(empty archive)'}.`,
+      )
+    }
+    return gmlEntries.map(([, data]) => Buffer.from(data.buffer, data.byteOffset, data.byteLength))
+  }
+  if (buffer.length >= 2 && buffer[0] === 0x1f && buffer[1] === 0x8b) {
+    return [gunzipSync(buffer)]
+  }
+  return [buffer]
 }
 
 /**
@@ -168,5 +207,102 @@ export function extractParcels(gmlText) {
       parcels.push({ titleNumber, polygons: rings })
     }
   }
+  return parcels
+}
+
+// Matches one parcel feature's OPENING tag (any namespace prefix, either
+// known local name), capturing the exact tag text written (e.g.
+// "LR:PREDEFINED") so the matching closing tag can be searched for by the
+// same literal string — real files use one prefix consistently, but this
+// doesn't assume which one.
+const FEATURE_OPEN_TAG_RE = new RegExp(`<((?:[\\w.-]+:)?(?:${PARCEL_FEATURE_NAMES.join('|')}))\\b[^>]*>`, 'gi')
+
+const DEFAULT_WINDOW_BYTES = 32 * 1024 * 1024 // 32MB — arbitrary but small enough that a single window's .toString('utf8') is nowhere near V8's ~536M-character string limit, large enough that most real feature elements fit inside one window untouched by a chunk boundary
+const MAX_CARRY_CHARS = 64 * 1024 * 1024 // safety valve — see below
+
+/**
+ * Real incident (Oct 2026): decoding a handful of outlier-sized councils'
+ * GML (The North Yorkshire Council, Cornwall) and counties' GML (Dumfries)
+ * as one JS string — what extractGmlTexts/decompressIfGzip's
+ * `.toString('utf8')` does — hit V8's hard per-string length ceiling
+ * ("Cannot create a string longer than 0x1fffffe8 characters" /
+ * "Invalid string length"), confirmed from real job logs. These files are
+ * large enough that even the UTF-16 string representation of their raw
+ * UTF-8 bytes exceeds that ceiling.
+ *
+ * Fix: never hold the whole document as one string. This reads the raw
+ * bytes (a Buffer, not stringified — extractGmlBuffers above) in fixed-
+ * size windows, stringifying only one bounded window at a time (always
+ * far under the limit), and extracts each complete parcel-feature element
+ * as soon as both its opening and closing tag have appeared across the
+ * accumulated (but bounded) text — at which point that one small feature
+ * string is handed to extractParcels() UNCHANGED, reusing the exact same
+ * proven parsing logic (title-number extraction, posList→ring conversion,
+ * the LR:PREDEFINED-vs-cp:CadastralParcel tolerance) already verified
+ * against 315+ real councils/counties. Only how the raw bytes get split
+ * into feature-sized pieces is new here — not how a feature gets parsed.
+ *
+ * A feature split across a window boundary is handled naturally: if a
+ * window ends mid-feature (opening tag seen, closing tag not yet), that
+ * partial text is carried forward and prepended to the next window rather
+ * than discarded.
+ */
+export function extractParcelsFromLargeBuffer(gmlBuffer, { windowBytes = DEFAULT_WINDOW_BYTES } = {}) {
+  const parcels = []
+  let carry = ''
+  let offset = 0
+
+  while (offset < gmlBuffer.length) {
+    let end = Math.min(offset + windowBytes, gmlBuffer.length)
+    // Never split a multi-byte UTF-8 character across the window boundary:
+    // back off while the next byte is a UTF-8 continuation byte (10xxxxxx),
+    // unless this window already reaches the buffer's real end.
+    if (end < gmlBuffer.length) {
+      while (end > offset && (gmlBuffer[end] & 0xc0) === 0x80) end--
+    }
+    carry += gmlBuffer.toString('utf8', offset, end)
+    offset = end
+
+    let consumedThrough = 0
+    FEATURE_OPEN_TAG_RE.lastIndex = 0
+    let openMatch
+    while ((openMatch = FEATURE_OPEN_TAG_RE.exec(carry))) {
+      const tagName = openMatch[1]
+      const closeTag = `</${tagName}>`
+      const closeIdx = carry.indexOf(closeTag, FEATURE_OPEN_TAG_RE.lastIndex)
+      if (closeIdx === -1) break // closing tag not in the buffer yet — stop, carry the rest forward
+
+      const featureXml = carry.slice(openMatch.index, closeIdx + closeTag.length)
+      parcels.push(...extractParcels(featureXml))
+      consumedThrough = closeIdx + closeTag.length
+      FEATURE_OPEN_TAG_RE.lastIndex = consumedThrough
+    }
+    carry = carry.slice(consumedThrough)
+
+    // Safety valve: a feature's open tag found but no close tag across an
+    // ever-growing carry means something doesn't match expectations (a
+    // genuinely malformed file, or these features really do nest/span
+    // more than 64MB of markup, which real cadastral data never does) —
+    // fail loudly rather than silently re-accumulating toward the same
+    // string-length ceiling this function exists to avoid.
+    if (carry.length > MAX_CARRY_CHARS) {
+      throw new Error(
+        `extractParcelsFromLargeBuffer: no complete parcel feature closed within a ${MAX_CARRY_CHARS / (1024 * 1024)}MB window — the file's structure doesn't match what this streaming parser expects (a flat, non-nested list of ${PARCEL_FEATURE_NAMES.join('/')} elements).`,
+      )
+    }
+  }
+
+  // Reaching end-of-input with an unclosed feature tag still in `carry`
+  // means the file was truncated or malformed (the 64MB valve above only
+  // catches an unclosed tag that grew large before input ran out, not one
+  // that simply ran out of bytes) — fail loudly here too, rather than
+  // silently returning whatever parcels happened to close before the cut.
+  FEATURE_OPEN_TAG_RE.lastIndex = 0
+  if (FEATURE_OPEN_TAG_RE.test(carry)) {
+    throw new Error(
+      `extractParcelsFromLargeBuffer: input ended with an unclosed parcel feature tag still open — the file is likely truncated or malformed.`,
+    )
+  }
+
   return parcels
 }
