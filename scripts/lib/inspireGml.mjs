@@ -16,8 +16,22 @@ import { bngToWgs84 } from './bngToWgs84.mjs'
  * incident and the fix. Shared by both build-title-tiles-{ew,scotland}.mjs
  * so each can fall back to the streaming parser on exactly this failure
  * and no other.
+ *
+ * Real incident (Oct 2026): this originally checked `err instanceof
+ * RangeError`, which missed the real failure live. `Buffer.prototype
+ * .toString('utf8')` on an oversized buffer throws Node's own
+ * `ERR_STRING_TOO_LONG` — a plain `Error` (name "Error", NOT instanceof
+ * RangeError) with `.code === 'ERR_STRING_TOO_LONG'` and this same
+ * message text. Only the older, string-concatenation-style V8 overflow
+ * (`RangeError: Invalid string length`, e.g. from `.repeat()` or `+`)
+ * is a true RangeError. Confirmed both shapes directly: Cornwall and
+ * The North Yorkshire Council hit the first (so the streaming fallback
+ * below never actually ran for them despite looking like it should —
+ * the condition silently rethrew instead), Dumfries's parse hit the
+ * second. Checking `.code` first catches both regardless of prototype.
  */
 export function isStringTooLongError(err) {
+  if (err?.code === 'ERR_STRING_TOO_LONG') return true
   return err instanceof RangeError && /string length|longer than/i.test(err.message)
 }
 

@@ -162,8 +162,24 @@ export async function writeParcelsToShardParts(outDir, nation, parcels) {
   const dir = join(outDir, nation, '_parts')
   await mkdir(dir, { recursive: true })
 
+  // Real incident (Oct 2026): Dumfries's own parse succeeded (30,752
+  // parcels, confirmed from the real job log) but the NEXT line —
+  // `lines.join('\n')` — hit "Invalid string length". Registration
+  // counties don't deduplicate the way England/Wales councils do, so a
+  // large county's own single call here can still produce far more
+  // lines for one shard than any one council ever did; joining them all
+  // into one string hits the exact same V8 ceiling
+  // extractParcelsFromLargeBuffer exists to avoid on the parsing side.
+  // Fix: append in bounded batches — still far fewer, larger writes than
+  // one appendFile() per line, but no single string ever holds more
+  // than LINES_PER_APPEND_BATCH lines' worth of JSON.
+  const LINES_PER_APPEND_BATCH = 5000
   for (const [shardId, lines] of linesByShard) {
-    await appendFile(partsFilePath(outDir, nation, shardId), lines.join('\n') + '\n')
+    const path = partsFilePath(outDir, nation, shardId)
+    for (let i = 0; i < lines.length; i += LINES_PER_APPEND_BATCH) {
+      const batch = lines.slice(i, i + LINES_PER_APPEND_BATCH)
+      await appendFile(path, batch.join('\n') + '\n')
+    }
   }
 
   return linesByShard.size
