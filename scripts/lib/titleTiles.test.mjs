@@ -9,7 +9,9 @@ import {
   cellIdsForRings,
   CELL_SIZE_DEG,
   FINE_CELLS_PER_SHARD,
+  NUM_RELEASE_PARTITIONS,
   finalizeShards,
+  releasePartitionForShardId,
   shardIdForCellId,
   writeParcelsToShardParts,
 } from './titleTiles.mjs'
@@ -47,46 +49,40 @@ const wideRing = [
 const wideCells = cellIdsForRings([wideRing])
 assert.ok(wideCells.length >= 2, `expected >=2 cells for a wide ring, got ${wideCells.length}`)
 
-// shardIdForCellId: every fine cell within one FINE_CELLS_PER_SHARD x
-// FINE_CELLS_PER_SHARD block must resolve to the same shard id, and a
-// fine cell just outside that block must resolve to a different one.
-// Base is deliberately chosen at a shard-aligned start (both bucket
-// values exact multiples of FINE_CELLS_PER_SHARD) — floor() groups
-// [n*k, n*k+1, ..., n*k+k-1] into shard n, so only a block starting
-// exactly there can safely add up to k-1 and stay inside it; starting
-// from an arbitrary (non-aligned) cell id, as an earlier version of this
-// test did, can walk into the next shard for negative buckets.
-const baseCellId = '500_-40'
-const [baseLat, baseLng] = baseCellId.split('_').map(Number)
-const sameShardCellId = `${baseLat + FINE_CELLS_PER_SHARD - 1}_${baseLng + FINE_CELLS_PER_SHARD - 1}`
-const differentShardCellId = `${baseLat + FINE_CELLS_PER_SHARD}_${baseLng}`
-assert.equal(shardIdForCellId(baseCellId), shardIdForCellId(sameShardCellId))
-assert.notEqual(shardIdForCellId(baseCellId), shardIdForCellId(differentShardCellId))
+// shardIdForCellId: at FINE_CELLS_PER_SHARD=1 a shard IS a fine cell —
+// every cell id must map to its own, distinct shard id (not grouped with
+// any neighbour). This is the one invariant that changed from this
+// module's earlier (grouped) design; see FINE_CELLS_PER_SHARD's own
+// comment for why grouping was removed entirely.
+assert.equal(FINE_CELLS_PER_SHARD, 1)
+assert.equal(shardIdForCellId('500_-40'), '500_-40')
+assert.notEqual(shardIdForCellId('500_-40'), shardIdForCellId('500_-39'))
+assert.notEqual(shardIdForCellId('500_-40'), shardIdForCellId('501_-40'))
 
-// writeParcelsToShardParts + finalizeShards: write once, then append a
-// second parcel to a DIFFERENT fine cell that lands in the SAME shard, and
-// confirm both survive as separate lines in one finalized gzipped shard
-// file (no accidental overwrite across fine cells, and no duplicate shard
-// files). Unlike the old read-modify-write design, re-sending the same
-// title_number again does NOT replace an earlier line — each call is a
-// pure append, so both lines show up; see titleTiles.mjs's header comment
-// for why the within-run dedup this used to do was dropped as unnecessary.
+// releasePartitionForShardId: every partition index actually used must
+// be in range, and two shards far enough apart in latitude to land in
+// different bands (not just adjacent — adjacent bands can share a
+// partition by design, see that function's own comment on why it's a
+// modulo split) must be able to land in different partitions.
+for (let lat = -5; lat <= 5; lat++) {
+  const p = releasePartitionForShardId(`${lat}_0`)
+  assert.ok(p >= 0 && p < NUM_RELEASE_PARTITIONS, `partition ${p} out of range for lat ${lat}`)
+}
+const partitionsSeen = new Set()
+for (let lat = 500; lat < 500 + NUM_RELEASE_PARTITIONS * 5; lat++) {
+  partitionsSeen.add(releasePartitionForShardId(`${lat}_0`))
+}
+assert.equal(partitionsSeen.size, NUM_RELEASE_PARTITIONS, 'a run of consecutive latitudes should spread across every partition')
+
+// writeParcelsToShardParts + finalizeShards: two parcels in the SAME fine
+// cell (two titles can genuinely share one, e.g. adjoining small plots)
+// must survive as two separate lines in one shard file, with no
+// accidental overwrite.
 const outDir = await mkdtemp(join(tmpdir(), 'title-tiles-test-'))
 try {
   const fineCellIdA = cellIdForPoint(50.715, -3.535) // tinyRing's cell
-  // Pick whichever neighbour (lng bucket -1 or +1) actually shares A's
-  // shard — which direction that is depends on where A happens to sit
-  // within its own shard block, not something safe to assume either way.
-  const [aLatBucket, aLngBucket] = fineCellIdA.split('_').map(Number)
-  const lngNeighbourOffset = shardIdForCellId(`${aLatBucket}_${aLngBucket - 1}`) === shardIdForCellId(fineCellIdA) ? -1 : 1
-  const fineCellIdB = `${aLatBucket}_${aLngBucket + lngNeighbourOffset}`
-  assert.equal(
-    shardIdForCellId(fineCellIdA),
-    shardIdForCellId(fineCellIdB),
-    'test setup assumption broken: these two fine cells were expected to share a shard',
-  )
-
-  const ringB = tinyRing.map(([lng, lat]) => [lng + lngNeighbourOffset * CELL_SIZE_DEG, lat])
+  const ringB = tinyRing.map(([lng, lat]) => [lng + 0.001, lat]) // tiny nudge, same fine cell
+  assert.equal(cellIdForPoint(50.7151, -3.534), fineCellIdA, 'test setup assumption broken: ringB was expected to stay in the same fine cell')
 
   const touchedA = await writeParcelsToShardParts(outDir, 'england_wales', [
     { titleNumber: 'DN1', tenure: 'freehold', polygons: [tinyRing] },
@@ -98,8 +94,43 @@ try {
   ])
   assert.equal(touchedB, 1)
 
+  // A third parcel, scattered across two DISJOINT rings far apart (the
+  // real incident this module's per-ring tagging fixes — see
+  // writeParcelsToShardParts' own comment) — a cell strictly between the
+  // two rings, overlapping neither, must NOT receive a line for it, even
+  // though the old whole-parcel-bounding-box design would have tagged
+  // every cell in between.
+  const farRingA = [
+    [-3.54, 50.0],
+    [-3.53, 50.0],
+    [-3.53, 50.01],
+    [-3.54, 50.01],
+    [-3.54, 50.0],
+  ]
+  const farRingB = [
+    [-3.54, 52.0],
+    [-3.53, 52.0],
+    [-3.53, 52.01],
+    [-3.54, 52.01],
+    [-3.54, 52.0],
+  ]
+  const betweenCellId = cellIdForPoint(51.0, -3.535) // roughly midway in latitude between the two rings
+  const touchedScattered = await writeParcelsToShardParts(outDir, 'england_wales', [
+    { titleNumber: 'SCATTERED1', tenure: 'freehold', polygons: [farRingA, farRingB] },
+  ])
+  assert.equal(touchedScattered, 2, 'a scattered title should only touch shards near its OWN rings, not everything in between')
+  const betweenShardPath = join(outDir, 'england_wales', '_parts', `${shardIdForCellId(betweenCellId)}.ndjson`)
+  await assert.rejects(
+    readFile(betweenShardPath),
+    'a cell strictly between a scattered title\'s two disjoint rings must not get a part file for it at all',
+  )
+
   const shardsFinalized = await finalizeShards(outDir, 'england_wales')
-  assert.equal(shardsFinalized, 1, 'both parcels landed in the same shard, so finalizing should produce exactly one file')
+  assert.equal(
+    shardsFinalized,
+    3,
+    'fineCellIdA\'s shard (DN1+DN2) plus the two scattered rings\' own separate shards = 3 files',
+  )
 
   // The _parts directory should be gone after finalizing.
   await assert.rejects(readdir(join(outDir, 'england_wales', '_parts')))
@@ -116,12 +147,16 @@ try {
   const lineA = lines.find((l) => l.properties.title_number === 'DN1')
   const lineB = lines.find((l) => l.properties.title_number === 'DN2')
   assert.equal(lineA.c, fineCellIdA)
-  assert.equal(lineB.c, fineCellIdB)
+  assert.equal(lineB.c, fineCellIdA)
   assert.equal(lineA.geometry.type, 'MultiPolygon')
+  assert.equal(lineA.geometry.coordinates.length, 1, 'each written feature now carries exactly one ring (per-ring tagging), never a parcel\'s other members')
   assert.equal(lineA.properties.tenure, 'freehold')
 
   // Coordinate pass-through: confirm the written coordinate is still
-  // (within floating point noise) the original input coordinate.
+  // (within floating point noise) the original input coordinate — this
+  // ring is far too small (its own corners deviate hugely from a
+  // straight line between neighbours) for simplifyRing's small tolerance
+  // to touch any of its points.
   const outLng = lineA.geometry.coordinates[0][0][0][0]
   assert.ok(Math.abs(outLng - tinyRing[0][0]) < 1e-9)
 
@@ -133,7 +168,7 @@ try {
   const shardsFinalizedEmpty = await finalizeShards(outDir, 'scotland')
   assert.equal(shardsFinalizedEmpty, 0)
 
-  console.log('PASS: cell/shard id math is consistent, and writeParcelsToShardParts/finalizeShards produce correct gzipped NDJSON shards.')
+  console.log('PASS: cell/shard/partition id math is consistent, and writeParcelsToShardParts/finalizeShards produce correct gzipped NDJSON shards with per-ring tagging.')
 } finally {
   await rm(outDir, { recursive: true, force: true })
 }

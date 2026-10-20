@@ -29,21 +29,58 @@
 // 186MB decompressed, 75,349 lines - just gzip-DECOMPRESSING one shard
 // already cost ~2.1s of CPU time on Supabase's Edge Functions, which
 // hard-caps CPU time at 2s per request and isn't configurable on the
-// hosted platform (self-hosting only). Shrunk to 2 (0.2° shards, 4 fine
-// cells instead of 25) to bring that down to a safe margin - real
-// measurement against the same shard scaled this to roughly 336ms
-// decompress - while supabase/functions/lookup-title-boundary/index.ts's
-// own copy of this constant moved to match (comment there explains why
-// it's a copy, not an import). The smaller shards multiply the file
-// count by (5/2)^2 = 6.25x, which is why the publish step now splits
-// into one release per nation instead of one combined release - each
-// nation's own real shard count (119 EW / 103 Scotland before this
-// change) scales to roughly 740 / 640, comfortably under GitHub
-// Releases' 1,000-asset cap per release, where a combined ~1,380 would
-// not have been.
+// hosted platform (self-hosting only). First shrunk to 2 (0.2° shards),
+// which fixed the typical case but NOT the real worst case: measured
+// directly against the real rebuilt data, the densest England & Wales
+// shard (central London) still decompressed to 457MB (~5.6s CPU), and
+// the worst Scotland shard - only 1,458 lines, but 240MB decompressed
+// (~16s CPU) - turned out to have a DIFFERENT root cause entirely (see
+// writeParcelsToShardParts' own comment below).
+//
+// Shrunk again, this time to 1 - i.e. no shard grouping at all, a shard
+// IS a fine cell - which quarters a dense area's worst-case file size on
+// its own. Combined with writeParcelsToShardParts' per-ring fix below
+// (which was the dominant fix for Scotland's specific outliers), this
+// brought every real shard safely under budget - see this repo's build
+// workflow for the actual post-fix measurements.
+//
+// Four fine cells per shard (1,000ish EW/Scotland releases combined)
+// quadruples again at FINE_CELLS_PER_SHARD=1 - comfortably past GitHub's
+// 1,000-asset-per-release cap on its own now, which is why publishing
+// also split further, into releasePartitionForShardId's NUM_RELEASE_PARTITIONS
+// releases per nation rather than just one - see that function's comment.
 export const CELL_SIZE_DEG = 0.1
-export const FINE_CELLS_PER_SHARD = 2
+export const FINE_CELLS_PER_SHARD = 1
 export const SHARD_SIZE_DEG = CELL_SIZE_DEG * FINE_CELLS_PER_SHARD
+
+// How many fine-cell-wide bands a nation's shard count enough to still
+// exceed GitHub's 1,000-asset-per-release cap. Splitting further than two
+// releases is why this isn't simply hardcoded to 2: NUM_RELEASE_PARTITIONS
+// needs recomputing whenever the real post-build shard count changes
+// enough to threaten the cap again - see build-title-tiles.yml's own
+// asset-count check, which is the thing that actually catches that,
+// loudly, rather than trusting this comment to stay accurate forever.
+export const NUM_RELEASE_PARTITIONS = 3
+
+/**
+ * Which of a nation's NUM_RELEASE_PARTITIONS releases a shard's assets
+ * get published to / fetched from — split by the shard's latitude band,
+ * modulo the partition count, rather than by a fixed real-world latitude
+ * threshold. A modulo split needs no assumption about where a nation's
+ * real latitude range starts or ends (robust to future data, e.g. a
+ * future nation added to this pipeline), and spreads adjacent-latitude
+ * shards across *different* partitions — avoiding the lopsided releases
+ * a naive "first third of the lat range" split would produce if real
+ * parcel density itself varies by latitude band (as the England & Wales
+ * data already does - see FINE_CELLS_PER_SHARD's own comment on where
+ * the density problem concentrates).
+ * Must stay identical to the copy in
+ * supabase/functions/lookup-title-boundary/index.ts.
+ */
+export function releasePartitionForShardId(shardId) {
+  const [latBucket] = shardId.split('_').map(Number)
+  return ((latBucket % NUM_RELEASE_PARTITIONS) + NUM_RELEASE_PARTITIONS) % NUM_RELEASE_PARTITIONS
+}
 
 /** Must stay identical to the copy in supabase/functions/lookup-title-boundary/index.ts. */
 export function cellIdForPoint(lat, lng) {
@@ -106,6 +143,16 @@ import { appendFile, mkdir, readdir, rm } from 'node:fs/promises'
 import { join } from 'node:path'
 import { pipeline } from 'node:stream/promises'
 import { createGzip } from 'node:zlib'
+import { simplifyRing } from './simplifyRing.mjs'
+
+// ~3m at the equator (1° latitude ≈ 111,320m) — small relative to a
+// parcel boundary survey's own real-world accuracy, and the stored
+// geometry is already documented as "an indicative extent, not the legal
+// boundary" (0015_title_boundaries.sql), so shaving near-collinear
+// vertices off it changes nothing that actually mattered before this
+// fix. See simplifyRing.mjs's own header comment for the real incident
+// this exists for.
+const SIMPLIFY_TOLERANCE_DEG = 0.00003
 
 // ============================================================================
 // Real incident (Oct 2026): the first version of this module merged a new
@@ -155,6 +202,38 @@ function partsFilePath(outDir, nation, shardId) {
  * parcels: [{ titleNumber, tenure, polygons }] — polygons as
  * cellIdsForRings() above (array of rings, each [lng, lat] pairs).
  * Returns the number of distinct shards this call touched, for logging.
+ *
+ * Real incident (20 Oct 2026): a real Scottish title (SCT0002609904) is
+ * ONE line of NDJSON output but 1.19MB by itself — 232 disjoint polygon
+ * members (a title registered as scattered parts, e.g. common grazing
+ * rights spread across a whole county), several individual rings 200-340
+ * points long. The previous version of this function tagged a parcel's
+ * FULL geometry — every one of its members, together — into every fine
+ * cell touched by the COMBINED bounding box of all of them, computed in
+ * one cellIdsForRings(p.polygons) call. For a compact, single-member
+ * parcel (the overwhelming majority) that combined bbox IS the parcel's
+ * own real extent, so this was never wrong — but for a scattered title
+ * like this one, the combined bbox spans the whole county, so its entire
+ * 1.19MB geometry got duplicated into every fine cell across that span,
+ * including cells nowhere near any of its actual land. That's what made
+ * the shard containing it 240MB decompressed from only 1,458 lines — not
+ * shard size, a bounding-box mismatch.
+ *
+ * Fixed by tagging and writing PER RING instead of per parcel: each
+ * ring's own (small, honest) bounding box decides which fine cell(s) it
+ * — and only it — gets written into, and each written feature carries
+ * just that one ring, not the parcel's other, unrelated members. A
+ * genuinely compact single-ring parcel (everything else) is completely
+ * unaffected — cellIdsForRings([ring]) for its one ring is identical to
+ * the old cellIdsForRings(p.polygons) call. At query time this is
+ * transparent: fetchTile already accumulates every matching line for a
+ * cell into an array and findMatch already checks each one in turn, so
+ * several single-ring features sharing a title_number for the same cell
+ * behave exactly like the old multi-member feature did — except a lookup
+ * now also only ever returns the ONE member actually near the query
+ * point, rather than a scattered title's entire combined outline, which
+ * is a more sensible "indicative extent" for the admin map to draw
+ * anyway.
  */
 export async function writeParcelsToShardParts(outDir, nation, parcels) {
   // Grouped by shard first so each shard's parts file gets one append
@@ -162,17 +241,25 @@ export async function writeParcelsToShardParts(outDir, nation, parcels) {
   // tiny separate writes.
   const linesByShard = new Map()
   for (const p of parcels) {
-    const geometry = { type: 'MultiPolygon', coordinates: p.polygons.map((ring) => [ring]) }
-    for (const cellId of cellIdsForRings(p.polygons)) {
-      const shardId = shardIdForCellId(cellId)
-      const line = JSON.stringify({
-        c: cellId,
-        type: 'Feature',
-        properties: { title_number: p.titleNumber, tenure: p.tenure ?? null },
-        geometry,
-      })
-      if (!linesByShard.has(shardId)) linesByShard.set(shardId, [])
-      linesByShard.get(shardId).push(line)
+    for (const ring of p.polygons) {
+      // cellIdsForRings runs against the ORIGINAL ring — simplification
+      // can only drop points under the tolerance, so it can never move a
+      // ring's true bounding box, but cell membership is decided first
+      // regardless, so that's never something this code has to rely on.
+      const cellIds = cellIdsForRings([ring])
+      const simplifiedRing = simplifyRing(ring, SIMPLIFY_TOLERANCE_DEG)
+      const geometry = { type: 'MultiPolygon', coordinates: [[simplifiedRing]] }
+      for (const cellId of cellIds) {
+        const shardId = shardIdForCellId(cellId)
+        const line = JSON.stringify({
+          c: cellId,
+          type: 'Feature',
+          properties: { title_number: p.titleNumber, tenure: p.tenure ?? null },
+          geometry,
+        })
+        if (!linesByShard.has(shardId)) linesByShard.set(shardId, [])
+        linesByShard.get(shardId).push(line)
+      }
     }
   }
 
