@@ -83,6 +83,27 @@ jobs:
           cache: npm
       - run: npm ci
 
+      # Real incident (20 Oct 2026): a real --all run built and finalized
+      # every shard correctly (2,291 EW + 1,630 Scotland files), but
+      # Publish failed partway through the 4th of 6 releases with "HTTP
+      # 403: API rate limit exceeded for installation" - the default
+      # GITHUB_TOKEN's own rate limit (undocumented exact figure, but
+      # empirically well under the ~3,900 release-asset-upload calls
+      # NUM_RELEASE_PARTITIONS x 2 nations now needs) ran out partway
+      # through. A real user-owned PAT gets the much higher standard
+      # 5,000/hour authenticated-user limit instead, comfortably covering
+      # this. Checked HERE, before the ~2-hour build, rather than letting
+      # a real --all run spend that time only to fail at Publish again.
+      - name: Verify the release-publish PAT is configured
+        if: inputs.dry_run != 'true' && inputs.council == '' && inputs.county == ''
+        env:
+          HAS_PAT: ${{ secrets.TITLE_TILES_RELEASE_PAT != '' }}
+        run: |
+          if [ "$HAS_PAT" != "true" ]; then
+            echo "TITLE_TILES_RELEASE_PAT repo secret is not set. The default GITHUB_TOKEN's own rate limit isn't enough to publish NUM_RELEASE_PARTITIONS x 2 nations' worth of individual release-asset uploads (3,900+ calls) - confirmed by a real run hitting '403 API rate limit exceeded for installation' partway through. See docs/SETUP.md §15 (in the jamspr95/stopspotter repo) for how to create a fine-grained PAT (Contents: Read & Write, scoped to only this repo) and add it here as this secret." >&2
+            exit 1
+          fi
+
       # continue-on-error: a handful of per-council failures (a transient
       # fetch blip, one outlier council too large to parse — see below)
       # are close to GUARANTEED on every real --all run against 318
@@ -228,13 +249,43 @@ jobs:
       # (see this workflow's top-of-file comment). The edge function
       # computes the same latBucket-mod-partition-count formula to pick
       # which release to fetch from.
+      # TITLE_TILES_RELEASE_PAT, not the default GITHUB_TOKEN — see the
+      # "Verify the release-publish PAT is configured" step's own comment
+      # for the real incident (403 rate-limit) that made the default
+      # token insufficient here.
       - name: Publish releases (replaces every title-tiles-latest-{ew,scotland}-N entirely)
         if: inputs.dry_run != 'true' && inputs.council == '' && inputs.county == ''
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.TITLE_TILES_RELEASE_PAT }}
         run: |
           set -euo pipefail
           NUM_PARTITIONS=3
+
+          # Retries a release's delete+create a few times with backoff —
+          # even on the higher-quota PAT, a transient secondary rate
+          # limit (GitHub throttles bursts of many requests in a short
+          # window, separately from the hourly quota) is still plausible
+          # given how many individual asset-upload calls one release can
+          # need. Re-deletes before every attempt since a failed
+          # `gh release create` can leave a partially-uploaded release
+          # behind, which a bare retry would otherwise collide with.
+          publish_one_release() {
+            local tag="$1" title="$2"
+            shift 2
+            local assets=("$@")
+            local attempt
+            for attempt in 1 2 3 4 5; do
+              gh release delete "$tag" --yes || true
+              if gh release create "$tag" "${assets[@]}" --title "$title" --notes "Built $(date -u +%Y-%m-%d)"; then
+                return 0
+              fi
+              echo "Publishing $tag failed (attempt $attempt/5) - waiting $((attempt * 60))s before retrying, in case this was a transient rate limit." >&2
+              sleep $((attempt * 60))
+            done
+            echo "Giving up on $tag after 5 attempts." >&2
+            return 1
+          }
+
           for nation_tag in england_wales:ew scotland:scotland; do
             nation="${nation_tag%%:*}"
             tagsuffix="${nation_tag#*:}"
@@ -245,10 +296,7 @@ jobs:
                 echo "No $nation partition $p shards produced - leaving $tag untouched rather than publishing it empty." >&2
                 continue
               fi
-              gh release delete "$tag" --yes || true
-              gh release create "$tag" "${assets[@]}" \
-                --title "Title boundary tiles — $nation (partition $p)" \
-                --notes "Built $(date -u +%Y-%m-%d)"
+              publish_one_release "$tag" "Title boundary tiles — $nation (partition $p)" "${assets[@]}"
             done
           done
 
