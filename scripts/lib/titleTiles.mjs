@@ -20,12 +20,29 @@
 //   - CELL_SIZE_DEG (0.1°): the fine lookup grid. A shard's CONTENTS stay
 //     tagged by this, so the point-in-polygon test at query time only
 //     ever scans one small fine cell's worth of parcels.
-//   - SHARD_SIZE_DEG (0.5°, FINE_CELLS_PER_SHARD=5 fine cells per side):
-//     the file/release-asset boundary, keeping a full-GB build's file
-//     count (~128) comfortably under GitHub Releases' 1,000-asset cap.
-
+//   - SHARD_SIZE_DEG (FINE_CELLS_PER_SHARD fine cells per side): the
+//     file/release-asset boundary.
+//
+// Real incident (20 Oct 2026): FINE_CELLS_PER_SHARD was 5 (0.5° shards)
+// until the "Look up title" button started failing with "CPU Time
+// exceeded" on every real query. A real shard checked directly was
+// 186MB decompressed, 75,349 lines - just gzip-DECOMPRESSING one shard
+// already cost ~2.1s of CPU time on Supabase's Edge Functions, which
+// hard-caps CPU time at 2s per request and isn't configurable on the
+// hosted platform (self-hosting only). Shrunk to 2 (0.2° shards, 4 fine
+// cells instead of 25) to bring that down to a safe margin - real
+// measurement against the same shard scaled this to roughly 336ms
+// decompress - while supabase/functions/lookup-title-boundary/index.ts's
+// own copy of this constant moved to match (comment there explains why
+// it's a copy, not an import). The smaller shards multiply the file
+// count by (5/2)^2 = 6.25x, which is why the publish step now splits
+// into one release per nation instead of one combined release - each
+// nation's own real shard count (119 EW / 103 Scotland before this
+// change) scales to roughly 740 / 640, comfortably under GitHub
+// Releases' 1,000-asset cap per release, where a combined ~1,380 would
+// not have been.
 export const CELL_SIZE_DEG = 0.1
-export const FINE_CELLS_PER_SHARD = 5
+export const FINE_CELLS_PER_SHARD = 2
 export const SHARD_SIZE_DEG = CELL_SIZE_DEG * FINE_CELLS_PER_SHARD
 
 /** Must stay identical to the copy in supabase/functions/lookup-title-boundary/index.ts. */

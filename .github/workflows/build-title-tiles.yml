@@ -8,19 +8,26 @@ name: Build title boundary tiles
 #
 # Both build scripts write into one shared directory as
 # <nation>/<shardId>.json.gz (scripts/lib/titleTiles.mjs's
-# appendParcelsToTiles layout — each gzipped shard covers a 5x5 block of
-# the fine 0.1-degree lookup cells, keyed internally by fine cell id, so a
-# full-Great-Britain build produces roughly 128 shard files rather than
-# the ~3,000 individual fine-cell files an earlier version of this
-# pipeline would have — comfortably under GitHub Releases' 1,000-asset
-# cap, with real headroom). Release assets can't hold subdirectories and
-# must be named exactly <nation>_<shardId>.json.gz — the exact filename
-# supabase/functions/lookup-title-boundary/index.ts requests — so the
-# "flatten" step below copies each file into a single directory with that
-# prefix before upload, rather than uploading the raw tree directly.
-# (Uploading the tree as-is would hand `gh` bare `<shardId>.json.gz`
-# basenames with no nation prefix, which would both collide between the
-# two nations' same shard id and not match what the edge function fetches.)
+# appendParcelsToTiles layout). Release assets can't hold subdirectories
+# and must be named exactly <nation>_<shardId>.json.gz — the exact
+# filename supabase/functions/lookup-title-boundary/index.ts requests —
+# so the "flatten" step below copies each file into a per-nation
+# directory with that prefix before upload, rather than uploading the
+# raw tree directly.
+#
+# Real incident (20 Oct 2026): shards were originally a 5x5 block of
+# fine cells (~128 files total, comfortably under GitHub's 1,000-asset
+# cap), but a real shard checked directly turned out to be 186MB
+# decompressed - decompressing just ONE on every lookup cost ~2.1s of
+# CPU time, the entire budget Supabase's Edge Functions allow per
+# request (hard-capped, not configurable on the hosted platform). Shrunk
+# to a 2x2 block (scripts/lib/titleTiles.mjs's FINE_CELLS_PER_SHARD -
+# see its own comment for the real measurement behind this), which
+# multiplies the file count by (5/2)^2 = 6.25x - a combined single
+# release would land around 1,380 assets, over the cap. Published as two
+# separate per-nation releases instead (each nation's own real count
+# before this change - 119 EW, 103 Scotland - scales to roughly 740/640,
+# both comfortably under 1,000 on their own).
 on:
   schedule:
     # Both source registries publish at most quarterly (HMLR ~monthly,
@@ -123,70 +130,90 @@ jobs:
       # areas. It replaced the full 316/32-area release with ~29 shards.
       # A scoped run can now only ever inspect/log; it never reaches
       # Publish. Only a true --all run (both filters blank) may publish.
-      - name: Flatten shards into <nation>_<shardId>.json.gz release assets
+      - name: Flatten shards into per-nation <nation>_<shardId>.json.gz release assets
         if: inputs.dry_run != 'true' && inputs.council == '' && inputs.county == ''
         run: |
           set -euo pipefail
-          mkdir -p "$ASSETS_DIR"
+          mkdir -p "$ASSETS_DIR/england_wales" "$ASSETS_DIR/scotland"
           shopt -s nullglob
           for nation_dir in "$OUT_DIR"/*/; do
             nation="$(basename "$nation_dir")"
             for f in "$nation_dir"*.json.gz; do
-              cp "$f" "$ASSETS_DIR/${nation}_$(basename "$f")"
+              cp "$f" "$ASSETS_DIR/$nation/${nation}_$(basename "$f")"
             done
           done
-          count=$(find "$ASSETS_DIR" -name '*.json.gz' | wc -l)
-          echo "Flattened $count shard asset(s) into $ASSETS_DIR."
-          if [ "$count" -eq 0 ]; then
+          ew_count=$(find "$ASSETS_DIR/england_wales" -name '*.json.gz' | wc -l)
+          scotland_count=$(find "$ASSETS_DIR/scotland" -name '*.json.gz' | wc -l)
+          echo "Flattened $ew_count England & Wales, $scotland_count Scotland shard asset(s)."
+          if [ "$ew_count" -eq 0 ] && [ "$scotland_count" -eq 0 ]; then
             echo "No shard files were produced by either build script — refusing to publish an empty release." >&2
             exit 1
           fi
 
       # GitHub Releases cap out at 1000 assets per release (confirmed against
-      # GitHub's own docs, Oct 2026). A full Great-Britain build is expected
-      # to land around 128 shard files (see scripts/lib/titleTiles.mjs's
-      # 5x5-fine-cells-per-shard grouping) — comfortably under the cap, with
-      # real headroom — but this is still an ESTIMATE, not something provable
-      # from this sandbox (a real --all run needs the live HMLR/RoS sources,
-      # which this environment can't reach). Kept as a loud failure rather
-      # than a silent truncated publish if that estimate ever turns out
-      # wrong; if it fires, the fix is a larger FINE_CELLS_PER_SHARD, not a
-      # workaround here.
-      - name: Check asset count against GitHub's per-release limit
+      # GitHub's own docs, Oct 2026) — checked separately per nation since
+      # each now publishes to its own release (see this workflow's own
+      # top-of-file comment for why: FINE_CELLS_PER_SHARD shrunk 5->2 to
+      # fix a real CPU-time crash, which made a single combined release no
+      # longer fit). Expected roughly 740 EW / 640 Scotland for a full
+      # Great-Britain build - real counts, not an estimate this time, but
+      # still checked here rather than trusted, same as before. Kept as a
+      # loud failure rather than a silent truncated publish if that ever
+      # turns out wrong; if it fires, the fix is a larger
+      # FINE_CELLS_PER_SHARD (in both this repo's copy and
+      # supabase/functions/lookup-title-boundary/index.ts's duplicate) or
+      # splitting a nation's release further, not a workaround here.
+      - name: Check asset counts against GitHub's per-release limit
         if: inputs.dry_run != 'true' && inputs.council == '' && inputs.county == ''
         run: |
-          count=$(find "$ASSETS_DIR" -name '*.json.gz' | wc -l)
-          echo "$count shard asset(s) to publish."
-          if [ "$count" -gt 950 ]; then
-            echo "$count assets would exceed (or come dangerously close to) GitHub's documented 1000-asset-per-release limit." >&2
-            echo "Expected roughly 128 for a full Great-Britain build — see scripts/lib/titleTiles.mjs's FINE_CELLS_PER_SHARD. Increase that constant (in both this repo's copy and supabase/functions/lookup-title-boundary/index.ts's duplicate) rather than publishing a truncated set." >&2
-            exit 1
-          fi
+          for nation in england_wales scotland; do
+            count=$(find "$ASSETS_DIR/$nation" -name '*.json.gz' | wc -l)
+            echo "$nation: $count shard asset(s) to publish."
+            if [ "$count" -gt 950 ]; then
+              echo "$nation's $count assets would exceed (or come dangerously close to) GitHub's documented 1000-asset-per-release limit." >&2
+              exit 1
+            fi
+          done
 
       # gh release create takes a list of asset files/patterns and relies on
       # the CALLING SHELL to expand any glob in them (confirmed against the
       # installed gh CLI's own --help: "USAGE gh release create [<tag>]
       # [<filename>... | <pattern>...]", with its own example
       # `gh release create v1.2.3 ./dist/*.tgz` left unquoted) — it does not
-      # itself walk directories or expand `**`. $ASSETS_DIR/*.json.gz is a
-      # flat, single-level glob (no subdirectories by this point, see the
-      # flatten step above), so plain bash globbing is enough; no globstar
-      # needed.
-      - name: Publish release (replaces title-tiles-latest entirely)
+      # itself walk directories or expand `**`. $ASSETS_DIR/<nation>/*.json.gz
+      # is a flat, single-level glob (no subdirectories by this point, see
+      # the flatten step above), so plain bash globbing is enough; no
+      # globstar needed.
+      #
+      # Two separate releases, one per nation (title-tiles-latest-ew /
+      # title-tiles-latest-scotland) — not one combined release — so each
+      # stays comfortably under GitHub's 1,000-asset cap on its own (see
+      # this workflow's top-of-file comment). The edge function fetches
+      # from whichever release matches the nation it's checking.
+      - name: Publish releases (replaces both title-tiles-latest-{ew,scotland} entirely)
         if: inputs.dry_run != 'true' && inputs.council == '' && inputs.county == ''
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          gh release delete title-tiles-latest --yes || true
-          gh release create title-tiles-latest "$ASSETS_DIR"/*.json.gz \
-            --title "Title boundary tiles" \
-            --notes "Built $(date -u +%Y-%m-%d)"
+          for nation_tag in england_wales:title-tiles-latest-ew scotland:title-tiles-latest-scotland; do
+            nation="${nation_tag%%:*}"
+            tag="${nation_tag#*:}"
+            assets=("$ASSETS_DIR/$nation"/*.json.gz)
+            if [ ! -e "${assets[0]}" ]; then
+              echo "No $nation shards produced - leaving $tag untouched rather than publishing it empty." >&2
+              continue
+            fi
+            gh release delete "$tag" --yes || true
+            gh release create "$tag" "${assets[@]}" \
+              --title "Title boundary tiles — $nation" \
+              --notes "Built $(date -u +%Y-%m-%d)"
+          done
 
       - name: Scoped run — not publishing
         if: inputs.dry_run != 'true' && (inputs.council != '' || inputs.county != '')
         run: |
-          echo "council/county filter was set, so this run is verification-only — the live title-tiles-latest release was NOT touched. Run with both left blank to publish a real --all build." >&2
+          echo "council/county filter was set, so this run is verification-only — the live title-tiles-latest-{ew,scotland} releases were NOT touched. Run with both left blank to publish a real --all build." >&2
 
       # Surfaces a per-council failure as a red job (so it's never
       # silently missed) without having blocked the publish step above
