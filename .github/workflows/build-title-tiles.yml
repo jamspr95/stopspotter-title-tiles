@@ -261,31 +261,58 @@ jobs:
           set -euo pipefail
           NUM_PARTITIONS=3
 
-          # Retries a release's delete+create a few times with backoff —
-          # even on the higher-quota PAT, a transient secondary rate
-          # limit (GitHub throttles bursts of many requests in a short
-          # window, separately from the hourly quota) is still plausible
-          # given how many individual asset-upload calls one release can
-          # need. Re-deletes before every attempt since a failed
-          # `gh release create` can leave a partially-uploaded release
-          # behind, which a bare retry would otherwise collide with.
+          # Real incident (20 Oct 2026): the first version of this retry
+          # swallowed `gh release delete`'s result with `|| true`,
+          # reasoning that a failure just meant "didn't exist yet". A
+          # real run proved that wrong: delete hit a transient
+          # `HTTP 502: Server Error` on an existing release, got silently
+          # ignored, and every one of the 5 retries then failed `create`
+          # with "a release with the same tag name already exists" -
+          # the actual problem (delete didn't work) never got retried at
+          # all, just the symptom. Fixed by giving delete its own
+          # verified retry loop (gh release view confirms it's actually
+          # gone, not just that the delete command returned 0) before
+          # ever attempting create.
+          delete_release_if_exists() {
+            local tag="$1"
+            local attempt
+            for attempt in 1 2 3 4 5; do
+              if ! gh release view "$tag" >/dev/null 2>&1; then
+                return 0 # confirmed gone (or never existed) - safe to create
+              fi
+              gh release delete "$tag" --yes || true
+              sleep $((attempt * 15))
+            done
+            if ! gh release view "$tag" >/dev/null 2>&1; then
+              return 0
+            fi
+            echo "Could not confirm $tag was deleted after 5 attempts." >&2
+            return 1
+          }
+
           publish_one_release() {
             local tag="$1" title="$2"
             shift 2
             local assets=("$@")
             local attempt
             for attempt in 1 2 3 4 5; do
-              gh release delete "$tag" --yes || true
-              if gh release create "$tag" "${assets[@]}" --title "$title" --notes "Built $(date -u +%Y-%m-%d)"; then
+              if delete_release_if_exists "$tag" && gh release create "$tag" "${assets[@]}" --title "$title" --notes "Built $(date -u +%Y-%m-%d)"; then
                 return 0
               fi
-              echo "Publishing $tag failed (attempt $attempt/5) - waiting $((attempt * 60))s before retrying, in case this was a transient rate limit." >&2
+              echo "Publishing $tag failed (attempt $attempt/5) - waiting $((attempt * 60))s before retrying, in case this was a transient rate limit or server error." >&2
               sleep $((attempt * 60))
             done
             echo "Giving up on $tag after 5 attempts." >&2
             return 1
           }
 
+          # any_failed tracked rather than letting `set -e` abort the whole
+          # step on the first exhausted-retries release — one release
+          # genuinely failing (distinct from the OTHER 5 succeeding) should
+          # still let the rest publish, same "ship what worked, fail loudly
+          # rather than silently" shape as the per-council build failures
+          # below. Checked, then surfaced as a real exit code at the end.
+          any_failed=0
           for nation_tag in england_wales:ew scotland:scotland; do
             nation="${nation_tag%%:*}"
             tagsuffix="${nation_tag#*:}"
@@ -296,9 +323,13 @@ jobs:
                 echo "No $nation partition $p shards produced - leaving $tag untouched rather than publishing it empty." >&2
                 continue
               fi
-              publish_one_release "$tag" "Title boundary tiles — $nation (partition $p)" "${assets[@]}"
+              publish_one_release "$tag" "Title boundary tiles — $nation (partition $p)" "${assets[@]}" || any_failed=1
             done
           done
+          if [ "$any_failed" -eq 1 ]; then
+            echo "One or more releases failed to publish - see above for which. Any OTHER release that succeeded is still live; re-run this workflow to retry just the ones that didn't." >&2
+            exit 1
+          fi
 
       - name: Scoped run — not publishing
         if: inputs.dry_run != 'true' && (inputs.council != '' || inputs.county != '')
