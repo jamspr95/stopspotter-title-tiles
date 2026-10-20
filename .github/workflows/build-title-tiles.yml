@@ -261,33 +261,52 @@ jobs:
           set -euo pipefail
           NUM_PARTITIONS=3
 
-          # Real incident (20 Oct 2026): the first version of this retry
-          # swallowed `gh release delete`'s result with `|| true`,
-          # reasoning that a failure just meant "didn't exist yet". A
-          # real run proved that wrong: delete hit a transient
-          # `HTTP 502: Server Error` on an existing release, got silently
-          # ignored, and every one of the 5 retries then failed `create`
-          # with "a release with the same tag name already exists" -
-          # the actual problem (delete didn't work) never got retried at
-          # all, just the symptom. Fixed by giving delete its own
-          # verified retry loop (gh release view confirms it's actually
-          # gone, not just that the delete command returned 0) before
-          # ever attempting create.
-          delete_release_if_exists() {
-            local tag="$1"
-            local attempt
-            for attempt in 1 2 3 4 5; do
-              if ! gh release view "$tag" >/dev/null 2>&1; then
-                return 0 # confirmed gone (or never existed) - safe to create
-              fi
-              gh release delete "$tag" --yes || true
-              sleep $((attempt * 15))
-            done
+          # Real incident (20 Oct 2026): the first version of this retried
+          # `gh release delete` + `gh release create` on failure. Deleting
+          # a POPULATED release (hundreds of assets) turned out to be the
+          # one operation that's actually unreliable here — a real run hit
+          # a persistent `HTTP 502: Server Error` on deleting three
+          # specific releases, for over an hour of retries with backoff,
+          # never once succeeding; `gh release view` kept confirming they
+          # were still there. Retrying harder couldn't fix it, because the
+          # operation itself (not transient network flakiness) seems to be
+          # what's unreliable for a release with this many assets.
+          #
+          # Real fix: never delete a populated release at all. If the tag
+          # already exists, update it in place instead — `gh release
+          # upload --clobber` overwrites/adds assets, `gh release edit`
+          # updates the title/notes, and any STALE asset (a fine cell that
+          # produced a shard last time but not this time) is removed
+          # individually via `gh release delete-asset`, a much smaller,
+          # provenly reliable operation compared to deleting the whole
+          # release object. `gh release create` is only ever used for a
+          # tag that doesn't exist yet, which was never the operation that
+          # failed.
+          upsert_release() {
+            local tag="$1" title="$2"
+            shift 2
+            local assets=("$@")
+            local notes="Built $(date -u +%Y-%m-%d)"
+
             if ! gh release view "$tag" >/dev/null 2>&1; then
-              return 0
+              gh release create "$tag" "${assets[@]}" --title "$title" --notes "$notes"
+              return $?
             fi
-            echo "Could not confirm $tag was deleted after 5 attempts." >&2
-            return 1
+
+            gh release edit "$tag" --title "$title" --notes "$notes" || return 1
+            gh release upload "$tag" "${assets[@]}" --clobber || return 1
+
+            local new_names existing_names stale_names name
+            new_names=$(printf '%s\n' "${assets[@]}" | xargs -n1 basename | sort)
+            existing_names=$(gh release view "$tag" --json assets --jq '.assets[].name' | sort)
+            stale_names=$(comm -23 <(echo "$existing_names") <(echo "$new_names"))
+            if [ -n "$stale_names" ]; then
+              while IFS= read -r name; do
+                [ -z "$name" ] && continue
+                gh release delete-asset "$tag" "$name" --yes \
+                  || echo "Could not delete stale asset $name from $tag (non-fatal — it'll just sit there unused)." >&2
+              done <<< "$stale_names"
+            fi
           }
 
           publish_one_release() {
@@ -296,7 +315,7 @@ jobs:
             local assets=("$@")
             local attempt
             for attempt in 1 2 3 4 5; do
-              if delete_release_if_exists "$tag" && gh release create "$tag" "${assets[@]}" --title "$title" --notes "Built $(date -u +%Y-%m-%d)"; then
+              if upsert_release "$tag" "$title" "${assets[@]}"; then
                 return 0
               fi
               echo "Publishing $tag failed (attempt $attempt/5) - waiting $((attempt * 60))s before retrying, in case this was a transient rate limit or server error." >&2
