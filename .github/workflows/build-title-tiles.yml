@@ -294,11 +294,40 @@ jobs:
             fi
 
             gh release edit "$tag" --title "$title" --notes "$notes" || return 1
-            gh release upload "$tag" "${assets[@]}" --clobber || return 1
+
+            # Real incident (21 Oct 2026): re-running this workflow
+            # re-uploaded EVERY asset on every attempt, even ones
+            # byte-identical to what was already published — at ~700
+            # assets per release x 6 releases, that's thousands of
+            # wasted API calls, and is exactly what turned a single
+            # rate-limit hit into an unrecoverable one within the hour
+            # (every retry re-spent the same exhausted quota
+            # re-uploading assets that didn't need it, so it never
+            # actually got closer to finishing). One `gh release view`
+            # call up front, then skip uploading any local file whose
+            # size exactly matches the already-published asset of the
+            # same name — not a byte-for-byte guarantee, but real shard
+            # data only changes when the underlying HMLR/RoS source
+            # changes, which reliably changes a shard's compressed size
+            # too. This also makes a rate-limited retry genuinely
+            # cheaper the second time, not just a doomed repeat.
+            local existing new_assets=() asset base existing_size
+            existing=$(gh release view "$tag" --json assets --jq '.assets[] | "\(.name) \(.size)"')
+            for asset in "${assets[@]}"; do
+              base=$(basename "$asset")
+              existing_size=$(awk -v n="$base" '$1==n {print $2}' <<< "$existing")
+              if [ "$existing_size" = "$(stat -c%s "$asset")" ]; then
+                continue
+              fi
+              new_assets+=("$asset")
+            done
+            if [ "${#new_assets[@]}" -gt 0 ]; then
+              gh release upload "$tag" "${new_assets[@]}" --clobber || return 1
+            fi
 
             local new_names existing_names stale_names name
             new_names=$(printf '%s\n' "${assets[@]}" | xargs -n1 basename | sort)
-            existing_names=$(gh release view "$tag" --json assets --jq '.assets[].name' | sort)
+            existing_names=$(printf '%s\n' "$existing" | awk '{print $1}' | sort)
             stale_names=$(comm -23 <(echo "$existing_names") <(echo "$new_names"))
             if [ -n "$stale_names" ]; then
               while IFS= read -r name; do
@@ -309,18 +338,49 @@ jobs:
             fi
           }
 
+          # Real incident (21 Oct 2026): a fixed 60/120/180/240/300s
+          # backoff has no idea whether a failure was a genuine
+          # rate-limit (which resets on GitHub's own schedule, often
+          # much later than 5 minutes out) or a transient server error
+          # (which usually clears within seconds) — guessing wrong on a
+          # rate limit meant retrying before quota was actually back,
+          # burning the still-exhausted budget on another failed
+          # attempt, over and over, never recovering within the run.
+          # When a failure specifically says "API rate limit exceeded",
+          # ask GitHub directly when it resets (`gh api rate_limit`) and
+          # sleep until then instead of guessing; any other failure
+          # (502, network blip) keeps the short exponential backoff,
+          # since those really are usually transient.
+          rate_limit_reset_wait() {
+            local reset now wait
+            reset=$(gh api rate_limit --jq '.resources.core.reset' 2>/dev/null) || return 1
+            now=$(date +%s)
+            wait=$((reset - now + 5))
+            if [ "$wait" -gt 0 ]; then
+              echo "Rate limited — waiting ${wait}s for quota to reset (resets $(date -u -d "@$reset" +%H:%M:%S) UTC)..." >&2
+              sleep "$wait"
+            fi
+          }
+
           publish_one_release() {
             local tag="$1" title="$2"
             shift 2
             local assets=("$@")
-            local attempt
+            local attempt logfile
+            logfile=$(mktemp)
             for attempt in 1 2 3 4 5; do
-              if upsert_release "$tag" "$title" "${assets[@]}"; then
+              if upsert_release "$tag" "$title" "${assets[@]}" 2>&1 | tee "$logfile"; then
+                rm -f "$logfile"
                 return 0
               fi
-              echo "Publishing $tag failed (attempt $attempt/5) - waiting $((attempt * 60))s before retrying, in case this was a transient rate limit or server error." >&2
-              sleep $((attempt * 60))
+              if grep -qi "API rate limit exceeded" "$logfile"; then
+                rate_limit_reset_wait
+              else
+                echo "Publishing $tag failed (attempt $attempt/5) - waiting $((attempt * 60))s before retrying, in case this was a transient server error." >&2
+                sleep $((attempt * 60))
+              fi
             done
+            rm -f "$logfile"
             echo "Giving up on $tag after 5 attempts." >&2
             return 1
           }
